@@ -31,6 +31,8 @@ def _make_account(
     label: str = "Test Calendar",
     cal_type: str = "ews",
     config: dict | None = None,
+    visibility: str = "shared",
+    owner_id: int | None = None,
 ) -> CalendarAccount:
     if config is None:
         config = {
@@ -38,7 +40,10 @@ def _make_account(
             "username_env": "CAL_TEST_USER",
             "password_env": "CAL_TEST_PASS",
         }
-    return CalendarAccount(name=name, label=label, type=cal_type, config=config)
+    return CalendarAccount(
+        name=name, label=label, type=cal_type, config=config,
+        visibility=visibility, owner_id=owner_id,
+    )
 
 
 def _make_event(
@@ -574,3 +579,252 @@ class TestGetPendingNotifications:
 
         result = await server.get_pending_notifications()
         assert result[0]["tts"] is True
+
+
+# ---------------------------------------------------------------------------
+# Visibility config tests
+# ---------------------------------------------------------------------------
+
+class TestVisibilityConfig:
+    def test_default_visibility_shared(self, tmp_path, monkeypatch):
+        """Calendar without visibility field defaults to 'shared'."""
+        cfg = tmp_path / "cal.yaml"
+        cfg.write_text(textwrap.dedent("""\
+            calendars:
+              - name: family
+                type: google
+                credentials_file: "/config/creds.json"
+        """))
+        monkeypatch.setattr(config_module, "CONFIG_PATH", str(cfg))
+        accounts = config_module.load_config()
+        assert accounts["family"].visibility == "shared"
+        assert accounts["family"].owner_id is None
+
+    def test_owner_visibility_with_owner_id(self, tmp_path, monkeypatch):
+        """visibility: owner + owner_id loads correctly."""
+        cfg = tmp_path / "cal.yaml"
+        cfg.write_text(textwrap.dedent("""\
+            calendars:
+              - name: work
+                type: ews
+                visibility: owner
+                owner_id: 1
+                ews_url: "https://exchange.example.com/EWS/Exchange.asmx"
+                username_env: U
+                password_env: P
+        """))
+        monkeypatch.setattr(config_module, "CONFIG_PATH", str(cfg))
+        accounts = config_module.load_config()
+        assert accounts["work"].visibility == "owner"
+        assert accounts["work"].owner_id == 1
+
+    def test_owner_without_owner_id_raises(self, tmp_path, monkeypatch):
+        """visibility: owner without owner_id raises ValueError."""
+        cfg = tmp_path / "cal.yaml"
+        cfg.write_text(textwrap.dedent("""\
+            calendars:
+              - name: work
+                type: ews
+                visibility: owner
+                ews_url: "https://exchange.example.com/EWS/Exchange.asmx"
+                username_env: U
+                password_env: P
+        """))
+        monkeypatch.setattr(config_module, "CONFIG_PATH", str(cfg))
+        with pytest.raises(ValueError, match="requires 'owner_id'"):
+            config_module.load_config()
+
+    def test_invalid_visibility_raises(self, tmp_path, monkeypatch):
+        """Invalid visibility value raises ValueError."""
+        cfg = tmp_path / "cal.yaml"
+        cfg.write_text(textwrap.dedent("""\
+            calendars:
+              - name: work
+                type: ews
+                visibility: private
+                ews_url: "https://exchange.example.com/EWS/Exchange.asmx"
+                username_env: U
+                password_env: P
+        """))
+        monkeypatch.setattr(config_module, "CONFIG_PATH", str(cfg))
+        with pytest.raises(ValueError, match="invalid visibility"):
+            config_module.load_config()
+
+    def test_visibility_fields_not_in_config_dict(self, tmp_path, monkeypatch):
+        """visibility and owner_id should not leak into the config dict."""
+        cfg = tmp_path / "cal.yaml"
+        cfg.write_text(textwrap.dedent("""\
+            calendars:
+              - name: work
+                type: ews
+                visibility: owner
+                owner_id: 1
+                ews_url: "https://exchange.example.com/EWS/Exchange.asmx"
+                username_env: U
+                password_env: P
+        """))
+        monkeypatch.setattr(config_module, "CONFIG_PATH", str(cfg))
+        accounts = config_module.load_config()
+        assert "visibility" not in accounts["work"].config
+        assert "owner_id" not in accounts["work"].config
+
+
+# ---------------------------------------------------------------------------
+# Visibility filtering tests
+# ---------------------------------------------------------------------------
+
+class TestVisibilityFiltering:
+    """Tests for user_id-based visibility filtering across all tools."""
+
+    def _setup_two_calendars(self):
+        """Set up work (owner, user 1) and family (shared) calendars."""
+        server._accounts = {
+            "work": _make_account("work", "Firmenkalender", visibility="owner", owner_id=1),
+            "family": _make_account("family", "Familienkalender", cal_type="google",
+                                    config={"credentials_file": "/x"}, visibility="shared"),
+        }
+
+    async def test_list_calendars_nouser_id_sees_all(self):
+        """user_id=None sees all calendars (backward-compat)."""
+        self._setup_two_calendars()
+        result = await server.list_calendars()
+        assert len(result["calendars"]) == 2
+
+    async def test_list_calendars_owner_sees_own_and_shared(self):
+        """user_id=1 (owner) sees both work and family."""
+        self._setup_two_calendars()
+        result = await server.list_calendars(user_id=1)
+        names = [c["name"] for c in result["calendars"]]
+        assert "work" in names
+        assert "family" in names
+
+    async def test_list_calendars_other_user_sees_only_shared(self):
+        """user_id=2 sees only shared calendars."""
+        self._setup_two_calendars()
+        result = await server.list_calendars(user_id=2)
+        names = [c["name"] for c in result["calendars"]]
+        assert "family" in names
+        assert "work" not in names
+
+    async def test_list_events_all_calendars_filters_by_visibility(self):
+        """list_events(calendar='', user_id=2) merges only visible calendars."""
+        self._setup_two_calendars()
+        work_backend = _setup_mock_backend([_make_event("e1", "work", "Work Meeting")])
+        family_backend = _setup_mock_backend([_make_event("e2", "family", "Zahnarzt")])
+        server._backends = {"work": work_backend, "family": family_backend}
+
+        result = await server.list_events(start="2026-02-13", user_id=2)
+        assert result["count"] == 1
+        assert result["events"][0]["calendar"] == "family"
+        assert "work" not in result["calendars_queried"]
+
+    async def test_list_events_specific_owner_calendar_denied(self):
+        """list_events(calendar='work', user_id=2) returns access denied."""
+        self._setup_two_calendars()
+        result = await server.list_events(calendar="work", start="2026-02-13", user_id=2)
+        assert "error" in result
+        assert "Access denied" in result["error"]
+
+    async def test_list_events_specific_owner_calendar_allowed_for_owner(self):
+        """list_events(calendar='work', user_id=1) works for owner."""
+        self._setup_two_calendars()
+        backend = _setup_mock_backend([_make_event("e1", "work", "Meeting")])
+        server._backends = {"work": backend}
+
+        result = await server.list_events(calendar="work", start="2026-02-13", user_id=1)
+        assert result["count"] == 1
+
+    async def test_create_event_access_denied(self):
+        """create_event on owner calendar denied for non-owner."""
+        self._setup_two_calendars()
+        result = await server.create_event(
+            calendar="work", title="Test", start="2026-02-14T14:00:00",
+            end="2026-02-14T15:00:00", user_id=2,
+        )
+        assert "error" in result
+        assert "Access denied" in result["error"]
+
+    async def test_create_event_allowed_for_owner(self):
+        """create_event on owner calendar allowed for owner."""
+        self._setup_two_calendars()
+        created = _make_event("new-1", "work", "Meeting")
+        backend = _setup_mock_backend()
+        backend.create_event = AsyncMock(return_value=created)
+        server._backends = {"work": backend}
+
+        result = await server.create_event(
+            calendar="work", title="Meeting", start="2026-02-14T14:00:00",
+            end="2026-02-14T15:00:00", user_id=1,
+        )
+        assert result["success"] is True
+
+    async def test_get_event_access_denied(self):
+        """get_event on owner calendar denied for non-owner."""
+        self._setup_two_calendars()
+        result = await server.get_event(calendar="work", event_id="e1", user_id=2)
+        assert "error" in result
+        assert "Access denied" in result["error"]
+
+    async def test_delete_event_access_denied(self):
+        """delete_event on owner calendar denied for non-owner."""
+        self._setup_two_calendars()
+        result = await server.delete_event(calendar="work", event_id="e1", user_id=2)
+        assert "error" in result
+        assert "Access denied" in result["error"]
+
+    async def test_update_event_access_denied(self):
+        """update_event on owner calendar denied for non-owner."""
+        self._setup_two_calendars()
+        result = await server.update_event(
+            calendar="work", event_id="e1", title="New Title", user_id=2,
+        )
+        assert "error" in result
+        assert "Access denied" in result["error"]
+
+    async def test_notifications_filters_by_visibility(self):
+        """get_pending_notifications(user_id=2) skips owner calendars."""
+        from datetime import timedelta
+
+        self._setup_two_calendars()
+        now = datetime.now()
+        event_start = now + timedelta(minutes=30)
+
+        work_event = _make_event("e1", "work", "Work Meeting", start=event_start, end=event_start + timedelta(hours=1))
+        family_event = _make_event("e2", "family", "Zahnarzt", start=event_start, end=event_start + timedelta(hours=1))
+
+        work_backend = _setup_mock_backend(events=[work_event])
+        family_backend = _setup_mock_backend(events=[family_event])
+        server._backends = {"work": work_backend, "family": family_backend}
+
+        result = await server.get_pending_notifications(user_id=2)
+        calendars = {r["data"]["calendar"] for r in result}
+        assert "family" in calendars
+        assert "work" not in calendars
+
+    async def test_notifications_nouser_id_sees_all(self):
+        """get_pending_notifications() (no user_id, poller) sees all calendars."""
+        from datetime import timedelta
+
+        self._setup_two_calendars()
+        now = datetime.now()
+        event_start = now + timedelta(minutes=30)
+
+        work_event = _make_event("e1", "work", "Work Meeting", start=event_start, end=event_start + timedelta(hours=1))
+        family_event = _make_event("e2", "family", "Zahnarzt", start=event_start, end=event_start + timedelta(hours=1))
+
+        work_backend = _setup_mock_backend(events=[work_event])
+        family_backend = _setup_mock_backend(events=[family_event])
+        server._backends = {"work": work_backend, "family": family_backend}
+
+        result = await server.get_pending_notifications()
+        calendars = {r["data"]["calendar"] for r in result}
+        assert calendars == {"work", "family"}
+
+    async def test_shared_calendar_visible_to_any_user(self):
+        """A shared calendar is visible to any authenticated user."""
+        server._accounts = {
+            "family": _make_account("family", "Familienkalender", visibility="shared"),
+        }
+        result = await server.list_calendars(user_id=999)
+        assert len(result["calendars"]) == 1
+        assert result["calendars"][0]["name"] == "family"

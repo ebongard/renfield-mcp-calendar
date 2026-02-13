@@ -70,6 +70,29 @@ def _validate_calendar(calendar: str) -> dict | None:
     return None
 
 
+def _visible_calendars(user_id: int | None) -> dict[str, CalendarAccount]:
+    """Return calendars visible to user_id. None = all (no auth)."""
+    if user_id is None:
+        return dict(_accounts)
+    return {
+        name: acct for name, acct in _accounts.items()
+        if acct.visibility == "shared" or acct.owner_id == user_id
+    }
+
+
+def _check_calendar_access(calendar: str, user_id: int | None) -> dict | None:
+    """Return error dict if no access, None if allowed."""
+    err = _validate_calendar(calendar)
+    if err:
+        return err
+    if user_id is None:
+        return None
+    acct = _accounts[calendar]
+    if acct.visibility == "shared" or acct.owner_id == user_id:
+        return None
+    return {"error": f"Access denied: calendar '{calendar}' is not visible to you"}
+
+
 def _event_to_dict(event: CalendarEvent) -> dict[str, Any]:
     """Convert CalendarEvent to JSON-friendly dict."""
     return {
@@ -98,17 +121,21 @@ mcp = FastMCP("renfield-calendar")
 
 
 @mcp.tool()
-async def list_calendars() -> dict:
+async def list_calendars(user_id: int | None = None) -> dict:
     """List all configured calendar accounts.
 
     Returns name, label, and type for each calendar.
+
+    Args:
+        user_id: User ID for visibility filtering (injected by Renfield). None = all calendars.
     """
-    if not _accounts:
+    visible = _visible_calendars(user_id)
+    if not visible:
         return {"error": "No calendars configured"}
     return {
         "calendars": [
             {"name": a.name, "label": a.label, "type": a.type}
-            for a in _accounts.values()
+            for a in visible.values()
         ]
     }
 
@@ -118,16 +145,18 @@ async def list_events(
     calendar: str = "",
     start: str = "",
     end: str = "",
+    user_id: int | None = None,
 ) -> dict:
     """List events from one or all calendars.
 
-    If calendar is empty, returns merged events from ALL calendars sorted chronologically.
+    If calendar is empty, returns merged events from ALL visible calendars sorted chronologically.
     Start/end default to today if not provided.
 
     Args:
         calendar: Calendar name (e.g. "work", "family"). Empty = all calendars.
         start: Start date/time (ISO 8601, e.g. "2026-02-13" or "2026-02-13T09:00:00"). Default: today 00:00.
         end: End date/time (ISO 8601). Default: today 23:59.
+        user_id: User ID for visibility filtering (injected by Renfield). None = all calendars.
     """
     # Parse date range
     now = datetime.now()
@@ -149,12 +178,12 @@ async def list_events(
 
     # Determine which calendars to query
     if calendar:
-        err = _validate_calendar(calendar)
+        err = _check_calendar_access(calendar, user_id)
         if err:
             return err
         calendars_to_query = [calendar]
     else:
-        calendars_to_query = list(_accounts.keys())
+        calendars_to_query = list(_visible_calendars(user_id).keys())
 
     # Fetch events from all requested calendars
     all_events: list[CalendarEvent] = []
@@ -195,6 +224,7 @@ async def create_event(
     end: str,
     description: str = "",
     location: str = "",
+    user_id: int | None = None,
 ) -> dict:
     """Create a new calendar event.
 
@@ -205,8 +235,9 @@ async def create_event(
         end: End date/time (ISO 8601, e.g. "2026-02-14T15:00:00")
         description: Event description (optional)
         location: Event location (optional)
+        user_id: User ID for visibility filtering (injected by Renfield). None = all calendars.
     """
-    err = _validate_calendar(calendar)
+    err = _check_calendar_access(calendar, user_id)
     if err:
         return err
 
@@ -239,6 +270,7 @@ async def update_event(
     end: str = "",
     description: str = "",
     location: str = "",
+    user_id: int | None = None,
 ) -> dict:
     """Update an existing calendar event. Only provided fields are changed.
 
@@ -250,8 +282,9 @@ async def update_event(
         end: New end date/time (optional)
         description: New description (optional)
         location: New location (optional)
+        user_id: User ID for visibility filtering (injected by Renfield). None = all calendars.
     """
-    err = _validate_calendar(calendar)
+    err = _check_calendar_access(calendar, user_id)
     if err:
         return err
 
@@ -288,14 +321,15 @@ async def update_event(
 
 
 @mcp.tool()
-async def delete_event(calendar: str, event_id: str) -> dict:
+async def delete_event(calendar: str, event_id: str, user_id: int | None = None) -> dict:
     """Delete a calendar event.
 
     Args:
         calendar: Calendar name
         event_id: Event ID (from list_events or get_event)
+        user_id: User ID for visibility filtering (injected by Renfield). None = all calendars.
     """
-    err = _validate_calendar(calendar)
+    err = _check_calendar_access(calendar, user_id)
     if err:
         return err
 
@@ -313,14 +347,15 @@ async def delete_event(calendar: str, event_id: str) -> dict:
 
 
 @mcp.tool()
-async def get_event(calendar: str, event_id: str) -> dict:
+async def get_event(calendar: str, event_id: str, user_id: int | None = None) -> dict:
     """Get a single event with full details.
 
     Args:
         calendar: Calendar name
         event_id: Event ID
+        user_id: User ID for visibility filtering (injected by Renfield). None = all calendars.
     """
-    err = _validate_calendar(calendar)
+    err = _check_calendar_access(calendar, user_id)
     if err:
         return err
 
@@ -338,15 +373,17 @@ async def get_event(calendar: str, event_id: str) -> dict:
 @mcp.tool()
 async def get_pending_notifications(
     lookahead_minutes: int = 45,
+    user_id: int | None = None,
 ) -> list[dict]:
-    """Return pending notifications for upcoming events across all calendars.
+    """Return pending notifications for upcoming events across visible calendars.
 
-    Checks all configured calendars for events starting within the next
+    Checks visible calendars for events starting within the next
     `lookahead_minutes` and returns notification objects for reminders
     at 30-minute and 5-minute marks.
 
     Args:
         lookahead_minutes: How far ahead to look for events (default: 45 minutes).
+        user_id: User ID for visibility filtering (injected by Renfield). None = all calendars.
 
     Returns:
         List of notification dicts with event_type, title, message, urgency,
@@ -355,9 +392,10 @@ async def get_pending_notifications(
     now = datetime.now()
     dt_end = now + timedelta(minutes=lookahead_minutes)
 
-    # Collect events from all calendars
+    # Collect events from visible calendars
+    visible = _visible_calendars(user_id)
     all_events: list[CalendarEvent] = []
-    for cal_name in _accounts:
+    for cal_name in visible:
         backend = _get_backend(cal_name)
         if not backend:
             continue
