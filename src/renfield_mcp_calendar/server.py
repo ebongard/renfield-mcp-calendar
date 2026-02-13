@@ -335,6 +335,75 @@ async def get_event(calendar: str, event_id: str) -> dict:
         return {"error": f"Failed to get event: {e}"}
 
 
+@mcp.tool()
+async def get_pending_notifications(
+    lookahead_minutes: int = 45,
+) -> list[dict]:
+    """Return pending notifications for upcoming events across all calendars.
+
+    Checks all configured calendars for events starting within the next
+    `lookahead_minutes` and returns notification objects for reminders
+    at 30-minute and 5-minute marks.
+
+    Args:
+        lookahead_minutes: How far ahead to look for events (default: 45 minutes).
+
+    Returns:
+        List of notification dicts with event_type, title, message, urgency,
+        scheduled_at, dedup_key, and data fields.
+    """
+    now = datetime.now()
+    dt_end = now + timedelta(minutes=lookahead_minutes)
+
+    # Collect events from all calendars
+    all_events: list[CalendarEvent] = []
+    for cal_name in _accounts:
+        backend = _get_backend(cal_name)
+        if not backend:
+            continue
+        try:
+            events = await backend.list_events(now, dt_end)
+            all_events.extend(events)
+        except Exception as e:
+            logger.warning("Notification poll: failed to fetch from '%s': %s", cal_name, e)
+
+    if not all_events:
+        return []
+
+    notifications = []
+    for event in all_events:
+        minutes_until = (event.start - now).total_seconds() / 60
+
+        # Generate reminders at meaningful intervals
+        reminder_thresholds = [
+            (30, 5, "info"),    # 25-35 min: "In 30 Minuten"
+            (5, 3, "warning"),  # 2-8 min: "In 5 Minuten"
+        ]
+
+        for threshold, tolerance, urgency in reminder_thresholds:
+            if abs(minutes_until - threshold) <= tolerance:
+                cal_label = _accounts[event.calendar].label if event.calendar in _accounts else event.calendar
+                notifications.append({
+                    "event_type": "calendar.reminder_upcoming",
+                    "title": event.title,
+                    "message": f"In {threshold} Minuten: {event.title} ({cal_label})",
+                    "urgency": urgency,
+                    "scheduled_at": event.start.isoformat(),
+                    "dedup_key": f"calendar:{event.calendar}:{event.id}:{threshold}min",
+                    "tts": True,
+                    "data": {
+                        "calendar": event.calendar,
+                        "event_id": event.id,
+                        "event_start": event.start.isoformat(),
+                        "event_end": event.end.isoformat(),
+                        "minutes_until": round(minutes_until),
+                        "location": event.location,
+                    },
+                })
+
+    return notifications
+
+
 # ---------------------------------------------------------------------------
 # Google OAuth2 CLI helper
 # ---------------------------------------------------------------------------

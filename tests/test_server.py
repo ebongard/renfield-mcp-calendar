@@ -424,3 +424,153 @@ class TestHelpers:
         server._accounts = {"work": _make_account("work")}
         result = server._validate_calendar("work")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tool tests: get_pending_notifications
+# ---------------------------------------------------------------------------
+
+class TestGetPendingNotifications:
+    async def test_no_calendars(self):
+        """No calendars configured — returns empty list."""
+        result = await server.get_pending_notifications()
+        assert result == []
+
+    async def test_no_upcoming_events(self):
+        """Calendar has no events in lookahead window."""
+        server._accounts = {"work": _make_account("work")}
+        backend = _setup_mock_backend(events=[])
+        server._backends = {"work": backend}
+
+        result = await server.get_pending_notifications(lookahead_minutes=45)
+        assert result == []
+
+    async def test_event_at_30_minutes(self):
+        """Event starting in ~30 minutes should generate info notification."""
+        from datetime import timedelta
+
+        now = datetime.now()
+        event_start = now + timedelta(minutes=30)
+        event_end = event_start + timedelta(hours=1)
+
+        server._accounts = {"work": _make_account("work", label="Firmenkalender")}
+        event = _make_event("e1", "work", "Team Meeting", start=event_start, end=event_end)
+        backend = _setup_mock_backend(events=[event])
+        server._backends = {"work": backend}
+
+        result = await server.get_pending_notifications(lookahead_minutes=45)
+        assert len(result) == 1
+        assert result[0]["event_type"] == "calendar.reminder_upcoming"
+        assert result[0]["title"] == "Team Meeting"
+        assert "30 Minuten" in result[0]["message"]
+        assert "Firmenkalender" in result[0]["message"]
+        assert result[0]["urgency"] == "info"
+        assert result[0]["dedup_key"] == "calendar:work:e1:30min"
+        assert result[0]["data"]["calendar"] == "work"
+        assert result[0]["data"]["event_id"] == "e1"
+
+    async def test_event_at_5_minutes(self):
+        """Event starting in ~5 minutes should generate warning notification."""
+        from datetime import timedelta
+
+        now = datetime.now()
+        event_start = now + timedelta(minutes=5)
+        event_end = event_start + timedelta(hours=1)
+
+        server._accounts = {"work": _make_account("work", label="Firmenkalender")}
+        event = _make_event("e2", "work", "Standup", start=event_start, end=event_end)
+        backend = _setup_mock_backend(events=[event])
+        server._backends = {"work": backend}
+
+        result = await server.get_pending_notifications(lookahead_minutes=45)
+        assert len(result) == 1
+        assert result[0]["urgency"] == "warning"
+        assert "5 Minuten" in result[0]["message"]
+        assert result[0]["dedup_key"] == "calendar:work:e2:5min"
+
+    async def test_event_too_far_away(self):
+        """Event starting in 40 minutes — no 30min or 5min threshold match."""
+        from datetime import timedelta
+
+        now = datetime.now()
+        event_start = now + timedelta(minutes=40)
+        event_end = event_start + timedelta(hours=1)
+
+        server._accounts = {"work": _make_account("work")}
+        event = _make_event("e3", "work", "Far Away", start=event_start, end=event_end)
+        backend = _setup_mock_backend(events=[event])
+        server._backends = {"work": backend}
+
+        result = await server.get_pending_notifications(lookahead_minutes=45)
+        assert result == []
+
+    async def test_multiple_calendars(self):
+        """Events from multiple calendars should be included."""
+        from datetime import timedelta
+
+        now = datetime.now()
+        event1_start = now + timedelta(minutes=30)
+        event2_start = now + timedelta(minutes=5)
+
+        server._accounts = {
+            "work": _make_account("work", label="Firmenkalender"),
+            "family": _make_account("family", label="Familienkalender", cal_type="google", config={
+                "calendar_id": "primary",
+                "credentials_file": "/tmp/creds.json",
+                "token_file": "/tmp/token.json",
+            }),
+        }
+        event1 = _make_event("e1", "work", "Meeting", start=event1_start, end=event1_start + timedelta(hours=1))
+        event2 = _make_event("e2", "family", "Zahnarzt", start=event2_start, end=event2_start + timedelta(hours=1))
+
+        backend1 = _setup_mock_backend(events=[event1])
+        backend2 = _setup_mock_backend(events=[event2])
+        server._backends = {"work": backend1, "family": backend2}
+
+        result = await server.get_pending_notifications(lookahead_minutes=45)
+        assert len(result) == 2
+        calendars = {r["data"]["calendar"] for r in result}
+        assert calendars == {"work", "family"}
+
+    async def test_backend_failure_graceful(self):
+        """If one backend fails, others still return notifications."""
+        from datetime import timedelta
+
+        now = datetime.now()
+        event_start = now + timedelta(minutes=30)
+
+        server._accounts = {
+            "work": _make_account("work", label="Firmenkalender"),
+            "family": _make_account("family", label="Familienkalender", cal_type="google", config={
+                "calendar_id": "primary",
+                "credentials_file": "/tmp/creds.json",
+                "token_file": "/tmp/token.json",
+            }),
+        }
+
+        good_backend = _setup_mock_backend(events=[
+            _make_event("e1", "work", "Meeting", start=event_start, end=event_start + timedelta(hours=1))
+        ])
+        bad_backend = _setup_mock_backend()
+        bad_backend.list_events = AsyncMock(side_effect=Exception("Connection failed"))
+
+        server._backends = {"work": good_backend, "family": bad_backend}
+
+        result = await server.get_pending_notifications(lookahead_minutes=45)
+        assert len(result) == 1
+        assert result[0]["data"]["calendar"] == "work"
+
+    async def test_notification_has_tts_flag(self):
+        """Notifications should include tts=True for TTS delivery."""
+        from datetime import timedelta
+
+        now = datetime.now()
+        event_start = now + timedelta(minutes=30)
+
+        server._accounts = {"work": _make_account("work")}
+        event = _make_event("e1", "work", "Test", start=event_start, end=event_start + timedelta(hours=1))
+        backend = _setup_mock_backend(events=[event])
+        server._backends = {"work": backend}
+
+        result = await server.get_pending_notifications()
+        assert result[0]["tts"] is True
