@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renfield-mcp-calendar"
+version = "1.0.0"
+description = "MCP server for unified calendar access (Exchange EWS, Google Calendar, CalDAV)."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26.0",
+    "pyyaml>=6.0",
+    "exchangelib>=5.4",
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+    "google-auth-httplib2>=0.2",
+    "caldav>=1.4",
+    "python-dateutil>=2.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+renfield-mcp-calendar = "renfield_mcp_calendar.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["renfield_mcp_calendar*"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
