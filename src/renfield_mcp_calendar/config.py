@@ -14,6 +14,7 @@ logger = logging.getLogger("renfield-mcp-calendar")
 CONFIG_PATH = os.environ.get("CALENDAR_CONFIG", "/config/calendar_accounts.yaml")
 
 VALID_TYPES = {"ews", "google", "caldav"}
+VALID_VISIBILITIES = {"shared", "owner"}
 
 
 @dataclass
@@ -24,6 +25,8 @@ class CalendarAccount:
     label: str
     type: str  # ews, google, caldav
     config: dict[str, Any] = field(default_factory=dict)
+    visibility: str = "shared"  # "shared" | "owner"
+    owner_id: int | None = None  # matches _user_id from Renfield
 
 
 def load_config() -> dict[str, CalendarAccount]:
@@ -60,8 +63,25 @@ def load_config() -> dict[str, CalendarAccount]:
 
         label = entry.get("label", name)
 
-        # Collect type-specific config (everything except name/label/type)
-        config = {k: v for k, v in entry.items() if k not in ("name", "label", "type")}
+        # Visibility / owner_id
+        visibility = entry.get("visibility", "shared")
+        if visibility not in VALID_VISIBILITIES:
+            raise ValueError(
+                f"Calendar '{name}': invalid visibility '{visibility}'. "
+                f"Must be one of: {VALID_VISIBILITIES}"
+            )
+        raw_owner = entry.get("owner_id")
+        owner_id = int(raw_owner) if raw_owner is not None else None
+        if visibility == "owner" and owner_id is None:
+            raise ValueError(
+                f"Calendar '{name}': visibility 'owner' requires 'owner_id'"
+            )
+
+        # Collect type-specific config (everything except metadata fields)
+        config = {
+            k: v for k, v in entry.items()
+            if k not in ("name", "label", "type", "visibility", "owner_id")
+        }
 
         # Validate required fields per type
         if cal_type == "ews":
@@ -89,6 +109,9 @@ def load_config() -> dict[str, CalendarAccount]:
                 if not os.environ.get(env_var):
                     logger.warning("Calendar '%s': env var '%s' not set", name, env_var)
 
-        accounts[name] = CalendarAccount(name=name, label=label, type=cal_type, config=config)
+        accounts[name] = CalendarAccount(
+            name=name, label=label, type=cal_type, config=config,
+            visibility=visibility, owner_id=owner_id,
+        )
 
     return accounts
