@@ -421,6 +421,16 @@ async def get_pending_notifications(
         for threshold, tolerance, urgency in reminder_thresholds:
             if abs(minutes_until - threshold) <= tolerance:
                 cal_label = _accounts[event.calendar].label if event.calendar in _accounts else event.calendar
+
+                # Derive privacy level from calendar account visibility
+                acct = _accounts.get(event.calendar)
+                if acct and acct.visibility == "owner":
+                    privacy = "confidential"
+                    target_user_id = acct.owner_id
+                else:
+                    privacy = "personal"
+                    target_user_id = None
+
                 notifications.append({
                     "event_type": "calendar.reminder_upcoming",
                     "title": event.title,
@@ -429,6 +439,8 @@ async def get_pending_notifications(
                     "scheduled_at": event.start.isoformat(),
                     "dedup_key": f"calendar:{event.calendar}:{event.id}:{threshold}min",
                     "tts": True,
+                    "privacy": privacy,
+                    "target_user_id": target_user_id,
                     "data": {
                         "calendar": event.calendar,
                         "event_id": event.id,
